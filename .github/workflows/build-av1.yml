@@ -28,17 +28,22 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-           packages: 'platform-tools'
+          packages: "platform-tools"
 
       - name: Install native build tools
         run: |
+          set -euo pipefail
+
           sudo apt-get update
           sudo apt-get install -y ninja-build nasm python3-pip
+
           python3 -m pip install --user "meson==1.5.2"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Install Android native tools
         run: |
+          set -euo pipefail
+
           sdkmanager \
             "ndk;27.0.12077973" \
             "cmake;3.22.1"
@@ -46,6 +51,8 @@ jobs:
       - name: Fetch native library sources
         working-directory: media/libraries/decoder_av1/src/main/jni
         run: |
+          set -euo pipefail
+
           git clone --depth 1 --branch v0.9.0 \
             https://github.com/google/cpu_features.git
 
@@ -54,22 +61,73 @@ jobs:
 
       - name: Record source versions
         run: |
+          set -euo pipefail
+
           mkdir -p artifacts
 
           {
             echo "Media3:"
             git -C media rev-parse HEAD
 
+            echo
             echo "cpu_features:"
-            git -C media/libraries/decoder_av1/src/main/jni/cpu_features rev-parse HEAD
+            git -C media/libraries/decoder_av1/src/main/jni/cpu_features \
+              rev-parse HEAD
 
+            echo
             echo "dav1d:"
-            git -C media/libraries/decoder_av1/src/main/jni/dav1d rev-parse HEAD
+            git -C media/libraries/decoder_av1/src/main/jni/dav1d \
+              rev-parse HEAD
           } | tee artifacts/source-versions.txt
+
+      - name: Fix ARM64 NEON detection in Media3 JNI
+        working-directory: media/libraries/decoder_av1/src/main/jni
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("dav1d_jni.cc")
+          text = source.read_text(encoding="utf-8")
+
+          old = "#if CPU_FEATURES_COMPILED_ANY_ARM_NEON"
+          new = (
+              "#if CPU_FEATURES_COMPILED_ANY_ARM_NEON || "
+              "(defined(__aarch64__) && defined(__ARM_NEON))"
+          )
+
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(
+                  f"Expected exactly one NEON condition, found {count}. "
+                  "Patch aborted."
+              )
+
+          source.write_text(
+              text.replace(old, new, 1),
+              encoding="utf-8"
+          )
+
+          print("Patched ARM64 NEON detection:")
+          for number, line in enumerate(
+              source.read_text(encoding="utf-8").splitlines(), 1
+          ):
+              if "__aarch64__" in line:
+                  print(f"{source}:{number}: {line}")
+          PY
+
+          git diff --check
+          git diff -- dav1d_jni.cc
+
+          git diff -- dav1d_jni.cc \
+            > "$GITHUB_WORKSPACE/artifacts/arm64-neon.patch"
 
       - name: Build dav1d native libraries
         working-directory: media
         run: |
+          set -euo pipefail
+
           export AV1_MODULE_PATH="$PWD/libraries/decoder_av1/src/main"
           export NDK_PATH="$ANDROID_HOME/ndk/27.0.12077973"
           export HOST_PLATFORM="linux-x86_64"
@@ -85,7 +143,10 @@ jobs:
       - name: Build Media3 AV1 AAR
         working-directory: media
         run: |
+          set -euo pipefail
+
           chmod +x gradlew
+
           ./gradlew \
             :lib-decoder-av1:assembleRelease \
             --no-daemon \
@@ -94,6 +155,8 @@ jobs:
 
       - name: Collect and inspect AV1 AAR
         run: |
+          set -euo pipefail
+
           find media -type f \
             -name '*av1*release*.aar' \
             -exec cp {} artifacts/ \;
@@ -108,8 +171,14 @@ jobs:
 
           for file in artifacts/*.aar; do
             echo "Inspecting: $file"
-            unzip -l "$file"
-            unzip -l "$file" | grep -E 'jni/arm64-v8a/.*\.so'
+
+            listing=$(unzip -l "$file")
+            printf '%s\n' "$listing"
+
+            if ! grep -E 'jni/arm64-v8a/.*\.so' <<< "$listing"; then
+              echo "ERROR: ARM64 native libraries are missing from $file"
+              exit 1
+            fi
           done
 
           sha256sum artifacts/*.aar | tee artifacts/SHA256SUMS.txt
